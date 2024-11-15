@@ -2,7 +2,9 @@ import numpy as np
 import random
 import gym
 import os
+import pickle
 import deepdish as dd
+import matplotlib.pyplot as plt
 import boolean
 
 import torch
@@ -220,7 +222,7 @@ def exp_EVF(exp, models):
 class Agent(object):
     def __init__(self,
                  env,
-                 max_timesteps=2000000,
+                 max_timesteps=1500000,
                  learning_starts=10000,
                  train_freq=4,
                  target_update_freq=1000,
@@ -232,6 +234,8 @@ class Agent(object):
                  eps_final=0.01,
                  eps_timesteps=1000000,
                  print_freq=10,
+                 eval_num_eps=10,     # calculate average reward over this many episodes
+                 eval_max_steps=100,  # cap the eval episodes at this length
                  path=None):
         assert type(env.observation_space) == gym.spaces.Box
         assert type(env.action_space) == gym.spaces.Discrete
@@ -244,7 +248,35 @@ class Agent(object):
         self.batch_size = batch_size
         self.gamma = gamma
         self.print_freq = print_freq
+        self.eval_num_eps = eval_num_eps
+        self.eval_max_steps = eval_max_steps
         self.path = path
+
+        config = []
+        for config_var in [
+            'max_timesteps',
+            'learning_starts',
+            'train_freq',
+            'target_update_freq',
+            'learning_rate',
+            'batch_size',
+            'replay_buffer_size',
+            'gamma',
+            'eps_initial',
+            'eps_final',
+            'eps_timesteps',
+            'print_freq',
+            'eval_num_eps',
+            'eval_max_steps'
+        ]:
+            config.append(f'{config_var}: {eval(config_var)}\n')
+        print('-'*6 + ' Config ' + '-'*6, flush=True)
+        with open(path + 'config.txt', 'w') as f:
+            f.writelines(config)
+            for line in config:
+                print(line, end='')
+            print()
+        print('-'*20, flush=True)
 
         self.eps_schedule = LinearSchedule(eps_timesteps, eps_final, eps_initial)
 
@@ -260,10 +292,10 @@ class Agent(object):
         self.replay_buffer = ReplayBuffer(replay_buffer_size, N=(env.rmin-env.rmax)*env.diameter)
         self.steps = 0
 
-    def select_action(self, obs):
+    def select_action(self, obs, evaluate=False):
         sample = random.random()
         eps_threshold = self.eps_schedule(self.steps)
-        if sample > eps_threshold and len(self.replay_buffer.goals)>0:
+        if evaluate or (sample > eps_threshold and len(self.replay_buffer.goals))>0:
             obs = np.array(obs)
             obs = torch.from_numpy(obs).type(FloatTensor).unsqueeze(0)
             values = []
@@ -278,10 +310,42 @@ class Agent(object):
         else:
             sample_action = self.env.action_space.sample()
             return torch.IntTensor([[sample_action]])
+        
+    def evaluate(self):
+        '''
+        Evaluates the current policy without any exploration
+        Returns the average reward and the new observation after resetting the env again
+        '''
+        rewards = np.zeros((self.eval_num_eps))
+        for i in range(self.eval_num_eps):
+            obs = self.env.reset()
+            eval_rewards = 0
+            for t in range(self.eval_max_steps):
+                action = self.select_action(obs, evaluate=True)
+                obs, reward, done, info = self.env.step(int(action[0][0]))
+                eval_rewards += reward
+                if done:
+                    break
+            rewards[i] = eval_rewards
+        return np.mean(rewards), self.env.reset()
 
     def train(self):
         obs = self.env.reset()
         episode_rewards = [0.0]
+        episode_loss = [0.0]
+        episode_steps = [0]
+        num_episodes = 1
+
+        rew_fig       = plt.figure()
+        rew_axes       = rew_fig.subplots()
+        loss_fig      = plt.figure()
+        loss_axes     = loss_fig.subplots()
+        steps_fig     = plt.figure()
+        steps_axes    = steps_fig.subplots()
+        eval_rew_fig  = plt.figure()
+        eval_rew_axes = eval_rew_fig.subplots()
+
+        reward_eval = {'steps': [], 'episodes': [], 'avg_rewards': [], 'eval_num_eps': self.eval_num_eps, 'avg_safety_violations': []}
 
         for t in range(self.max_timesteps):
             action = self.select_action(obs)
@@ -293,6 +357,9 @@ class Agent(object):
             if done:
                 obs = self.env.reset()
                 episode_rewards.append(0.0)
+                episode_loss.append(0.0)
+                episode_steps.append(0)
+                num_episodes += 1
 
             if t > self.learning_starts and t % self.train_freq == 0:
                 obs_batch, act_batch, rew_batch, next_obs_batch, done_mask = self.replay_buffer.sample(self.batch_size)
@@ -312,6 +379,7 @@ class Agent(object):
                 target_q_values = rew_batch + (self.gamma * next_q_values)
 
                 loss = F.smooth_l1_loss(current_q_values, target_q_values)
+                episode_loss[-1] += float(loss.cpu())
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -326,13 +394,44 @@ class Agent(object):
                 print("\nModel saved\n")      
 
             self.steps += 1
+            episode_steps[-1] += 1
 
             mean_100ep_reward = round(np.mean(episode_rewards[-101:-1]), 1)
             num_episodes = len(episode_rewards)
-            if done and self.print_freq is not None and len(episode_rewards) % self.print_freq == 0:
+            if done and self.print_freq is not None and num_episodes % self.print_freq == 0:
                 print("--------------------------------------------------------")
                 print("steps {}".format(t))
                 print("episodes {}".format(num_episodes))
                 print("mean 100 episode reward {}".format(mean_100ep_reward))
                 print("% time spent exploring {}".format(int(100 * self.eps_schedule(t))))
-                print("--------------------------------------------------------")
+
+                print(f'Mean Episode Length Over 100 Episodes: {round(np.mean(episode_steps[-101:-1]))}')
+
+                # evaluate the model
+                avg_reward, obs = self.evaluate()
+                reward_eval['steps'].append(t)
+                reward_eval['episodes'].append(num_episodes)
+                reward_eval['avg_rewards'].append(avg_reward)
+
+                with open(self.path + 'reward_eval.pkl', 'wb') as f:
+                    pickle.dump(reward_eval, f)
+                print(f'Evaluation Rewards (averaged over {self.eval_num_eps} episodes): {avg_reward}')
+                print("--------------------------------------------------------", flush=True)
+
+                rew_axes.cla()
+                rew_axes.plot(episode_rewards[:-1])
+                rew_fig.savefig(self.path + 'episode_rewards.png')
+                np.save('episode_rewards.npy', np.array(episode_rewards[:-1]))
+                loss_axes.cla()
+                loss_axes.plot(episode_loss[:-1])
+                loss_fig.savefig(self.path + 'loss.png')
+                np.save('episode_loss.npy', np.array(episode_loss[:-1]))
+                steps_axes.cla()
+                steps_axes.plot(episode_steps[:-1])
+                steps_fig.savefig(self.path + 'episode_steps.png')
+                np.save('episode_steps.npy', np.array(episode_steps[:-1]))
+                eval_rew_axes.cla()
+                eval_rew_axes.plot(reward_eval['episodes'], reward_eval['avg_rewards'])
+                eval_rew_axes.set_xlabel('Episodes')
+                eval_rew_axes.set_ylabel(f'Evaluated Average Reward (over {self.eval_num_eps} episodes)')
+                eval_rew_fig.savefig(self.path + 'eval_avg_reward.png')
