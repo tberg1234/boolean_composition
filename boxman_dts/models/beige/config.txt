@@ -1,0 +1,15 @@
+max_timesteps: 1500000
+learning_starts: 10000
+train_freq: 4
+target_update_freq: 1000
+learning_rate: 0.0001
+batch_size: 128
+replay_buffer_size: 300000
+gamma: 0.99
+eps_initial: 1.0
+eps_final: 0.1
+eps_timesteps: 1800000
+print_freq: 100
+eval_num_eps: 100
+eval_max_steps: 100
+percent_loss_threshold: 0.1

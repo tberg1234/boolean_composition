@@ -1,0 +1,3 @@
+ending because positive average evaluation reward and loss is stable
+average reward: 0.4600000000000019
+percent difference in loss over 2 most recent sets of 100 episodes: 0.06194062616991815
