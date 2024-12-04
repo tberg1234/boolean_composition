@@ -54,11 +54,16 @@ def learn(colour, shape, condition):
     print(f"End training processor time (in seconds): {end_pro_time}")
     total_training_time = end_pro_time-start_pro_time
     print(f"Total elapsed training time as processor time (in seconds): {total_training_time}")
-    with open(base_path + 'train_time.txt', 'w') as f: f.write(total_training_time)
-    save(base_path + 'train_time.txt', end_pro_time - start_pro_time)
+    with open(base_path + 'train_time.txt', 'w') as f: f.write(str(total_training_time))
 
     save(base_path + 'model.dqn', agent)
 
 if __name__ == '__main__':
 
+    #color, shape, condition
+
+    learn('', 'circle', lambda x: x.shape == 'circle')
     learn('blue', '', lambda x: x.colour == 'blue')
+    learn('beige', '', lambda x: x.colour == 'beige')
+    learn('purple', '', lambda x: x.colour == 'purple')
+    learn('', 'square', lambda x: x.shape == 'square')

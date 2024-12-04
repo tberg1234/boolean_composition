@@ -1,3 +1,4 @@
+from collections import defaultdict
 import numpy as np
 import random
 import gym
@@ -231,11 +232,12 @@ class Agent(object):
                  replay_buffer_size=300000,
                  gamma=0.99,
                  eps_initial=1.0,
-                 eps_final=0.01,
-                 eps_timesteps=1000000,
-                 print_freq=10,
-                 eval_num_eps=10,     # calculate average reward over this many episodes
+                 eps_final=0.1,
+                 eps_timesteps=1800000,
+                 print_freq=100,
+                 eval_num_eps=100,     # calculate average reward over this many episodes
                  eval_max_steps=100,  # cap the eval episodes at this length
+                 percent_loss_threshold=0.10, #if loss within this percent of prev loss, then the loss is similar
                  path=None):
         assert type(env.observation_space) == gym.spaces.Box
         assert type(env.action_space) == gym.spaces.Discrete
@@ -250,6 +252,7 @@ class Agent(object):
         self.print_freq = print_freq
         self.eval_num_eps = eval_num_eps
         self.eval_max_steps = eval_max_steps
+        self.percent_loss_threshold = percent_loss_threshold
         self.path = path
 
         config = []
@@ -267,7 +270,8 @@ class Agent(object):
             'eps_timesteps',
             'print_freq',
             'eval_num_eps',
-            'eval_max_steps'
+            'eval_max_steps',
+            'percent_loss_threshold'
         ]:
             config.append(f'{config_var}: {eval(config_var)}\n')
         print('-'*6 + ' Config ' + '-'*6, flush=True)
@@ -299,13 +303,14 @@ class Agent(object):
             obs = np.array(obs)
             obs = torch.from_numpy(obs).type(FloatTensor).unsqueeze(0)
             values = []
-            for goal in self.replay_buffer.goals:
-                goal = torch.from_numpy(np.array(goal)).type(FloatTensor).unsqueeze(0)
-                x = torch.cat((obs,goal),dim=3)
-                values.append(self.q_func(Variable(x, volatile=True)).squeeze(0))
-            values = torch.stack(values,1).t()
-            action = values.data.max(0)[0].max(0)[1].reshape(1, 1) #self.q_func(Variable(obs, volatile=True)).data.max(1)[1].reshape(1, 1)
-            # Use volatile = True if variable is only used in inference mode, i.e. don’t save the history
+            with torch.no_grad():
+                for goal in self.replay_buffer.goals:
+                    goal = torch.from_numpy(np.array(goal)).type(FloatTensor).unsqueeze(0)
+                    x = torch.cat((obs,goal),dim=3)
+                    values.append(self.q_func(Variable(x)).squeeze(0))
+                values = torch.stack(values,1).t()
+                action = values.data.max(0)[0].max(0)[1].reshape(1, 1) #self.q_func(Variable(obs, volatile=True)).data.max(1)[1].reshape(1, 1)
+                # Use volatile = True if variable is only used in inference mode, i.e. don’t save the history
             return action
         else:
             sample_action = self.env.action_space.sample()
@@ -328,6 +333,14 @@ class Agent(object):
                     break
             rewards[i] = eval_rewards
         return np.mean(rewards), self.env.reset()
+    
+    def calculate_loss_percent_diff(self, loss):
+        if len(loss) > self.eval_num_eps*2:
+            recent_losses = np.array(loss[-self.eval_num_eps:])
+            older_losses = np.array(loss[-self.eval_num_eps*2:-self.eval_max_steps])
+            return abs(np.mean(recent_losses)-np.mean(older_losses))/((np.mean(recent_losses)+np.mean(older_losses))/2)
+        else:
+            return 0.0
 
     def train(self):
         obs = self.env.reset()
@@ -348,6 +361,7 @@ class Agent(object):
         reward_eval = {'steps': [], 'episodes': [], 'avg_rewards': [], 'eval_num_eps': self.eval_num_eps, 'avg_safety_violations': []}
 
         for t in range(self.max_timesteps):
+
             action = self.select_action(obs)
             new_obs, reward, done, info = self.env.step(int(action[0][0]))
             self.replay_buffer.add(obs, action.cpu(), reward, new_obs, done)
@@ -412,6 +426,7 @@ class Agent(object):
                 reward_eval['steps'].append(t)
                 reward_eval['episodes'].append(num_episodes)
                 reward_eval['avg_rewards'].append(avg_reward)
+                # reward_eval['avg_reward_goals'].append(avg_reward_goals)
 
                 with open(self.path + 'reward_eval.pkl', 'wb') as f:
                     pickle.dump(reward_eval, f)
@@ -421,17 +436,37 @@ class Agent(object):
                 rew_axes.cla()
                 rew_axes.plot(episode_rewards[:-1])
                 rew_fig.savefig(self.path + 'episode_rewards.png')
-                np.save('episode_rewards.npy', np.array(episode_rewards[:-1]))
+                np.save(self.path + 'episode_rewards.npy', np.array(episode_rewards[:-1]))
                 loss_axes.cla()
                 loss_axes.plot(episode_loss[:-1])
                 loss_fig.savefig(self.path + 'loss.png')
-                np.save('episode_loss.npy', np.array(episode_loss[:-1]))
+                np.save(self.path + 'episode_loss.npy', np.array(episode_loss[:-1]))
                 steps_axes.cla()
                 steps_axes.plot(episode_steps[:-1])
                 steps_fig.savefig(self.path + 'episode_steps.png')
-                np.save('episode_steps.npy', np.array(episode_steps[:-1]))
+                np.save(self.path + 'episode_steps.npy', np.array(episode_steps[:-1]))
                 eval_rew_axes.cla()
                 eval_rew_axes.plot(reward_eval['episodes'], reward_eval['avg_rewards'])
                 eval_rew_axes.set_xlabel('Episodes')
                 eval_rew_axes.set_ylabel(f'Evaluated Average Reward (over {self.eval_num_eps} episodes)')
                 eval_rew_fig.savefig(self.path + 'eval_avg_reward.png')
+
+                loss_percent_diff = self.calculate_loss_percent_diff(episode_loss)
+                print(f"Percent difference in loss over 2 most recent sets of {self.eval_num_eps} episodes: {loss_percent_diff}")
+                print(loss_percent_diff <= self.percent_loss_threshold)
+
+                if avg_reward>0 and num_episodes > 2*self.eval_num_eps and loss_percent_diff<=self.percent_loss_threshold: #since loss requires 200 episode history, min number of episodes is 200
+                    exp = "ending because positive average evaluation reward and loss is stable"
+                    print(exp)
+                    f = open(self.path + 'finished_explanation.txt', "w")
+                    f.write(exp + "\n")
+                    f.write(f"average reward: {avg_reward}\n")
+                    f.write(f"percent difference in loss over 2 most recent sets of {self.eval_num_eps} episodes: {loss_percent_diff}")
+                    f.close()
+                    return
+
+        exp = "ending because max number of training steps reached"
+        print(exp)
+        f = open(self.path + 'finished_explanation.txt', "w")
+        f.write(exp + "\n")
+        f.close()
